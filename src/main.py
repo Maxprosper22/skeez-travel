@@ -13,6 +13,7 @@ from asyncio.subprocess import PIPE
 import httpx, aiohttp
 
 from src.utils.db import db_conn, db_pool
+from src.utils.tasks import trip_task, transaction_pooler
 
 from src.services import register_services
 from src.services.celery_app import app as celeryapp, email_verification, email_reset_link
@@ -83,13 +84,13 @@ def create_app() -> Sanic:
     """" Application factory """
 
     app = Sanic("Skrid")
-    Extend(app)
 
     app.ctx.CLIENT_URL = os.getenv("CLIENT_URL")
 
-    app.config.CORS_ORIGINS = [app.ctx.CLIENT_URL]
+    app.config.CORS_ORIGINS = f"{app.ctx.CLIENT_URL}"
     app.config.CORS_SUPPORTS_CREDENTIALS = True
     app.config.CORS_AUTOMATIC_OPTIONS = True
+    Extend(app)
 
     # Load encryption key
     app.ctx.ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY').encode()
@@ -113,7 +114,9 @@ def create_app() -> Sanic:
     app.ctx.CeleryApp = celeryapp
     app.ctx.tasks ={
         'email_verification': email_verification,
-        'email_reset_link': email_reset_link
+        'email_reset_link': email_reset_link,
+        'transaction_pooler': transaction_pooler,
+        'trip_task': trip_task
     }
 
     db_config = load_database_config()
@@ -143,7 +146,7 @@ def create_app() -> Sanic:
         
         redis_url = os.getenv("VALKEY_URL") or os.getenv("REDIS_URL")
         jobstore = {
-            'default': RedisJobStore(url=redis_url)
+            'default': RedisJobStore()
         }
         executors = {
             'default': ThreadPoolExecutor(20),

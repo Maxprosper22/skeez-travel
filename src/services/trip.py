@@ -1,13 +1,19 @@
 import asyncio
 from asyncio import PriorityQueue
+
 from dataclasses import dataclass
 from enum import Enum
+
 from pydantic import BaseModel, Field, field_validator, model_validator
+
 from sanic import Sanic
+from sanic.log import logger
+
 from asyncpg.pool import Pool
 from uuid import UUID
 from typing import Optional, Dict
 from datetime import datetime, timedelta
+
 import pprint
 import json
 
@@ -17,9 +23,16 @@ from src.models.trip import TripStatus, Trip, Destination
 from src.models.account import Account
 from src.models.ticket import Ticket, TicketStatus
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from src.utils.tasks import trip_task
+
+
 class EventType(Enum):
     REMINDER = "reminder"
     TRIP_START = "trip_start"
+
 
 @dataclass(order=True)
 class TripEvent:
@@ -27,14 +40,24 @@ class TripEvent:
     event_type: EventType
     trip: Trip
 
+
 class TripService:
 
-    def __init__(self, pool: Pool, publisher: Publisher, channel_name: str):
+    def __init__(
+        self,
+        app: Sanic,
+        pool: Pool,
+        publisher: Publisher,
+        channel_name: str,
+        scheduler: AsyncIOScheduler
+    ):
+        self.app = app
         self.trips: Dict[UUID, Trip] = {}
         self.queue = PriorityQueue()
         self.pool: Pool = pool
         self.reminder_offset = timedelta(days=1)
         # self.running: bool = False
+        self.scheduler = scheduler   # APScheduler instance
         self.channel: Channel = Channel[channel_name]
         self.publisher: Publisher = publisher
 
@@ -92,51 +115,55 @@ class TripService:
                     records.remove(trip)
 
             for trip_item in records:
-                # for slot in trip_item['accounts']:
-                trip = Trip(
-                    trip_id = trip_item["trip_id"],
-                    destination = trip_item["destination"],
-                    capacity = trip_item["capacity"],
-                    status = TripStatus(trip_item["status"]),
-                    date = trip_item["date"],
-                    # slots=SlotList().append(slot) for slot in 
-                )
-                await self._add_trip_events(trip)
+                if trip['date'] >= datetime.now():
+                    # for slot in trip_item['accounts']:
+                    trip = Trip(
+                        trip_id = trip_item["trip_id"],
+                        destination = trip_item["destination"],
+                        capacity = trip_item["capacity"],
+                        status = TripStatus(trip_item["status"]),
+                        date = trip_item["date"],
+                        # slots=SlotList().append(slot) for slot in 
+                    )
+                    # await self._add_trip_events(trip)
         except Exception as e:
             raise e
 
 
     async def _add_trip_events(self, trip: Trip):
-        """ Add reminder and trip start events to queue """
+        """ Add reminder and trip start events to scheduler/queue """
         try:
             self.trips[trip.trip_id] = trip
             # Add reminder event (1 day before)
             reminder_time = trip.date - self.reminder_offset
             if reminder_time > datetime.now():
-                await self.queue.put(TripEvent(reminder_time, EventType.REMINDER, trip))
-            # Add trip start event
-            await self.queue.put(TripEvent(trip.date, EventType.TRIP_START, trip))
+                cron_trigger = CronTrigger(start_date=reminder_time, end_date=trip.date)
+            else:
+                cron_trigger = CronTrigger(end_date=trip.date)
+
+            await self.scheduler.add_job(trip_task, trigger=cron_trigger, kwargs={'tripid': trip.trip_id, 'app': self.app})
 
         except Exception as e:
             raise e
 
 
-    async def create_channel(self, trip: Trip) -> None:
-        """ Creates a channel for each trip """
+    # async def create_channel(self, trip: Trip) -> None:
+    #     """ Creates a channel for each trip """
 
 
     async def create_trip(self, pool: Pool, trip: Trip) -> Optional[dict]:
         """ Create a trip instance """
         async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO trips (
-                    trip_id,
-                    destination_id, 
-                    capacity,
-                    status,
-                    date
-                ) VALUES ($1, $2, $3, $4, $5)
-            """,
+            async with conn.transaction():
+                await conn.execute("""
+                    INSERT INTO trips (
+                        trip_id,
+                        destination_id, 
+                        capacity,
+                        status,
+                        date
+                    ) VALUES ($1, $2, $3, $4, $5)
+                """,
                 trip.trip_id, trip.destination.destination_id, trip.capacity, trip.status.value, trip.date)
 
             await self._add_trip_events(trip)
@@ -215,24 +242,34 @@ class TripService:
             raise e
 
 
-        async def close_booking(self, pool: Pool, status: TicketStatus, tripid: UUID, accountid: UUID):
-            """ Complete a trip booking transaction """
-            try:
-                async with pool.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute("UPDATE tickets SET status=$1 WHERE trip_id=$2 AND account_id=$3", status.value, tripid, accountid)
-                        ticket = await conn.fetchrow("SELECT * FROM tickets WHERE trip_id=$1 AND account_id=$2", tripid, account_id)
+    async def complete_booking(self, status: TicketStatus, tripid: UUID, accountid: UUID):
+        """ Complete a trip booking transaction """
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("UPDATE tickets SET status=$1 WHERE trip_id=$2 AND account_id=$3", status.value, tripid.hex, accountid.hex)
+                    ticket = await conn.fetchrow("SELECT * FROM tickets WHERE trip_id=$1 AND account_id=$2", tripid, account_id)
 
-                return ticket if ticket else None
+            return ticket if ticket else None
 
-            except Exception as e:
-                raise e
+        except Exception as e:
+            raise e
 
 
-    async def unbook(self, pool: Pool, tripid: UUID, accountid: UUID):
+    # async def cancel_booking(self, status: TicketStatus, tripid: UUID, accountid: UUID):
+    #     """ Cancels and closes booking process after/due to failure """
+    #     try:
+    #         async with self.pool.acquire() as conn:
+    #             await conn.execute("DELETE FROM tickets WHERE trip_id=$1 AND account_id=$2", tripid, accountid)
+    #
+    #     except Exception as e:
+    #         logger.error(e)
+
+
+    async def cancel_booking(self, tripid: UUID, accountid: UUID):
         """ Removes a user from a trip's list """
         try:
-            async with pool.acquire() as conn:
+            async with self.pool.acquire() as conn:
                 await conn.execute("""DELETE FROM tickets WHERE trip_id=$1 AND account_id=$2""", tripid, accountid)
                 confirm_removal = await conn.fetchrow("SELECT * FROM tickets WHERE trip_id=$1 AND account_id=$2", tripid, accountid)
 
@@ -240,7 +277,7 @@ class TripService:
                     return "FAILURE"
                 return "SUCCESS"
         except Exception as e:
-            raise e
+            logger.error(e)
 
 
     async def send_notification(self, trip: Trip, event_type: EventType):
@@ -342,68 +379,141 @@ class TripService:
             raise e
 
 
-    async def fetch_trip(self, tripid: UUID) -> Optional[Trip]:
+    async def fetch_trip_by_destination(self, destinationid: UUID):
         """ Retrieve trip with matching id """
-        
-        pprint.pp(tripid)
-        async with self.pool.acquire() as conn:
-            trip_rec = await conn.fetchrow("""
-                SELECT
-                    trp.*,
-                    row_to_json(dests)::jsonb AS destination,
-                    COALESCE(array_agg(acct.*) FILTER (WHERE acct.* IS NOT NULL), '{}') AS slots
-                FROM 
-                    trips trp
-                LEFT JOIN
-                    destinations dests
-                ON
-                    trp.destination_id = dests.destination_id
-                LEFT JOIN
-                    tickets tkt 
-                ON
-                    trp.trip_id = tkt.trip_id
-                LEFT JOIN
-                    accounts acct
-                ON
-                    tkt.account_id = acct.account_id
-                WHERE
-                    trp.trip_id=$1
-                GROUP BY 
-                    trp.trip_id, dests""", 
-            tripid)
+        try:
+            pprint.pp(tripid)
+            async with self.pool.acquire() as conn:
+                trip_rec = await conn.fetchrow("""
+                    SELECT
+                        trp.*,
+                        row_to_json(dests)::jsonb AS destination,
+                        COALESCE(array_agg(acct.*) FILTER (WHERE acct.* IS NOT NULL), '{}') AS slots
+                    FROM 
+                        trips trp
+                    LEFT JOIN
+                        destinations dests
+                    ON
+                        trp.destination_id = dests.destination_id
+                    LEFT JOIN
+                        tickets tkt 
+                    ON
+                        trp.trip_id = tkt.trip_id
+                    LEFT JOIN
+                        accounts acct
+                    ON
+                        tkt.account_id = acct.account_id
+                    WHERE
+                        trp.destination_id=$1
+                    GROUP BY 
+                        trp.trip_id, dests""", 
+                destinationid)
+            if not trip_rec:
+                return None
+
+            return dict(trip_rec)
+        except Exception as e:
+            logger.error(e)
+
+
+    async def fetch_trip(self, tripid: UUID=None, destinationid: UUID=None, date: str|datetime=None) -> Optional[Trip]:
+        """ Retrieve trip with matching id """
+        try:
+            pprint.pp(tripid)
+            async with self.pool.acquire() as conn:
+                if trip_id:
+                    trip_rec = await conn.fetchrow("""
+                        SELECT
+                            trp.*,
+                            row_to_json(dests)::jsonb AS destination,
+                            COALESCE(array_agg(acct.*) FILTER (WHERE acct.* IS NOT NULL), '{}') AS slots
+                        FROM 
+                            trips trp
+                        LEFT JOIN
+                            destinations dests
+                        ON
+                            trp.destination_id = dests.destination_id
+                        LEFT JOIN
+                            tickets tkt 
+                        ON
+                            trp.trip_id = tkt.trip_id
+                        LEFT JOIN
+                            accounts acct
+                        ON
+                            tkt.account_id = acct.account_id
+                        WHERE
+                            trp.trip_id=$1
+                        GROUP BY 
+                            trp.trip_id, dests""", 
+                    tripid)
+                elif destinationid:
+                    trip_rec = await self.fetch_destination(destinationid)
+
+                elif date:
+                    if type(date) == str:
+                        date = datetime(date)
+
+                    trip_rec = await conn.fetchrow("""
+                        SELECT
+                            trp.*,
+                            row_to_json(dests)::jsonb AS destination,
+                            COALESCE(array_agg(acct.*) FILTER (WHERE acct.* IS NOT NULL), '{}') AS slots
+                        FROM 
+                            trips trp
+                        LEFT JOIN
+                            destinations dests
+                        ON
+                            trp.destination_id = dests.destination_id
+                        LEFT JOIN
+                            tickets tkt 
+                        ON
+                            trp.trip_id = tkt.trip_id
+                        LEFT JOIN
+                            accounts acct
+                        ON
+                            tkt.account_id = acct.account_id
+                        WHERE
+                            trp.date=$1
+                        GROUP BY 
+                            trp.trip_id, dests""", 
+                    date)
     
-        if not trip_rec:
-            return None
+            if not trip_rec:
+                return None
 
-        pprint.pp(trip_rec)
+            pprint.pp(trip_rec)
 
-        tripDict = dict(trip_rec)
-        tripDict['destination'] = json.loads(tripDict['destination'])
-        tripDict['status'] = TripStatus(tripDict['status'])
-        # tripDict['slots'] = [dict(slot) for slot in tripDict['slots'] if tripDict['slots']]
+            tripDict = dict(trip_rec)
+            tripDict['destination'] = json.loads(tripDict['destination'])
+            tripDict['status'] = TripStatus(tripDict['status'])
+            # tripDict['slots'] = [dict(slot) for slot in tripDict['slots'] if tripDict['slots']]
 
-        trip = Trip(
-            trip_id = tripDict['trip_id'],
-            destination=tripDict['destination'],
-            capacity=tripDict['capacity'],
-            status=tripDict['status'],
-            date=tripDict['date'],
-            slots = [
-                Account(
-                    account_id = slot['account_id'],
-                    email = slot['email'],
-                    phone_number = slot['phone_number'],
-                    password = slot['password'],
-                    firstname = slot['firstname'],
-                    lastname = slot['lastname'],
-                    othername = slot['othername'],
-                    join_date = slot['join_date'],
-                    is_admin = slot['is_admin']
-                ) for slot in tripDict['slots'] if tripDict['slots']
-            ]
-        )
+            trip = Trip(
+                trip_id = tripDict['trip_id'],
+                destination=tripDict['destination'],
+                capacity=tripDict['capacity'],
+                status=tripDict['status'],
+                date=tripDict['date'],
+                slots = [
+                    Account(
+                        account_id = slot['account_id'],
+                        email = slot['email'],
+                        phone_number = slot['phone_number'],
+                        password = slot['password'],
+                        firstname = slot['firstname'],
+                        lastname = slot['lastname'],
+                        othername = slot['othername'],
+                        join_date = slot['join_date'],
+                        is_admin = slot['is_admin']
+                    ) for slot in tripDict['slots'] if tripDict['slots']
+                ]
+            )
 
-        return trip
+            return trip
+
+        except Exception as e:
+            logger.error(e)
+
 
 
     async def create_destination(self, pool: Pool, destination: Destination):
@@ -431,6 +541,7 @@ class TripService:
             if not record:
                  return None
             return dict(record)
+
         except Exception as e:
             raise e
 

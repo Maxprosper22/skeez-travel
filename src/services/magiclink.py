@@ -93,3 +93,4 @@ def password_reset(password: str, link: str, messageFrom: str, messageTo: str):
 
     except Exception as e:
         raise e
+

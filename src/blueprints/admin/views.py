@@ -2,6 +2,7 @@ from sanic import Sanic
 from sanic.response import html as sanhtml, text as santext, json as sanjson
 from sanic.request import Request
 from sanic.views import HTTPMethodView
+from sanic.log import logger
 # from returns.maybe import Maybe, Some, Nothing
 
 from apscheduler.triggers.cron import CronTrigger
@@ -21,7 +22,7 @@ async def view_destinations(request: Request):
 
         return sanjson(body={'data': destinations if destinations else None})
     except Exception as e:
-        raise e
+        logger.error(e)
 
 
 async def new_destination(request: Request):
@@ -43,7 +44,7 @@ async def new_destination(request: Request):
 
         return sanjson(body={'data': data})
     except Exception as e:
-        raise e
+        logger.error(e)
 
 
 async def view_accounts(request: Request):
@@ -83,7 +84,7 @@ async def view_accounts(request: Request):
         return sanhtml(template.render(accounts=accounts))
 
     except Exception as e:
-        raise e
+        logger.error(e)
 
 
 async def fetch_accounts(request: Request):
@@ -123,7 +124,7 @@ async def fetch_accounts(request: Request):
         return sanjson(body={'data': accounts})
 
     except Exception as e:
-        raise e
+        logger.error(e)
 
 
 async def view_trips(request: Request):
@@ -138,7 +139,7 @@ async def view_trips(request: Request):
         return sanhtml(template.render())
 
     except Exception as e:
-        raise e
+        logger.error(e)
 
 
 async def fetch_trips(request: Request):
@@ -172,7 +173,7 @@ async def fetch_trips(request: Request):
         return sanjson(body={'data': trips})
 
     except Exception as e:
-        raise e
+        logger.error(e)
 
 
 async def create_trip(request: Request):
@@ -182,120 +183,124 @@ async def create_trip(request: Request):
         Note;
             [1]: Update code to directly search db for trip that matches the given data rather than fetch all trips and then iteratung over them.
     """
- 
-    app = request.app       # The Sanic app instance
-    # print('Application blueprints: ', app.blueprints)
-    # bp = app.bl
-    pool = app.ctx.pool     # Database connection pool
-    tripCtx = app.ctx.tripCtx
-    tripService = tripCtx["TripService"]    # TripController class instance
-    tripStatus = tripCtx['TripStatus']    # Trip status enum class
+    try:
+        app = request.app       # The Sanic app instance
+        # print('Application blueprints: ', app.blueprints)
+        # bp = app.bl
+        pool = app.ctx.pool     # Database connection pool
+        tripCtx = app.ctx.tripCtx
+        tripService = tripCtx["TripService"]    # TripController class instance
+        tripStatus = tripCtx['TripStatus']    # Trip status enum class
 
-    Trip = tripCtx['Trip']     # Trip class object (not instance!)
+        Trip = tripCtx['Trip']     # Trip class object (not instance!)
     
-    scheduler = app.ctx.scheduler
-    sse_clients = app.ctx.SSEClients
+        scheduler = app.ctx.scheduler
+        sse_clients = app.ctx.SSEClients
 
-    trip_data = request.json    # Form data submitted
-    pprint.pp(trip_data)
+        trip_data = request.json    # Form data submitted
+        pprint.pp(trip_data)
 
-    match trip_data:
-        case None:
-            return sanjson(
-                status=400,
-                body={
-                    'message': "Bad request. No data provided"
-                }
-            )
-        case {'destination': t_dest, 'date': t_date, 'capacity': t_cap, 'status': t_stat} if t_dest == None or t_date == None or t_cap == None or t_stat == None:
-            return sanjson(
-                status=400,
-                body={
-                    'message': 'Bad request. Missing required fields'
-                }
-            )
-    
-    match trip_data['status']:
-        case 'pending':
-            trip_data['status'] = tripStatus.PENDING
-        case 'active':
-            trip_data['status'] = tripStatus.ACTIVE
-
-    print(trip_data)
-
-    trips = tripService.trips 
-    
-    # See Note [1] for the code below
-
-    if len(trips) >= 1:
-         match trips:
-            case [Trip as trip] if trip['destination']==trip_data['destination'] and trip['status']==tripStatus.PENDING and trip['date']==trip_data['date'] and len(trip['slot']) < trip['capacity']:
-                # print(trip)
-                # await 
-
+        match trip_data:
+            case None:
                 return sanjson(
-                    status=403,
+                    status=400,
                     body={
-                        'status': 'err',
-                        "msg": f"Unable to create trip to '{trip_data.destination}'. Existing trip(s) with free slots found"
-                })
-
-    new_trip = Trip(
-        destination=trip_data['destination'],
-        date=trip_data['date'],
-        status=trip_data['status'],
-        capacity=trip_data['capacity']
-    )
-    print(new_trip)
-
-    await tripService.create_trip(pool, new_trip)
-    saved_trip = await tripService.fetch_trip(new_trip.trip_id)
-    print("New Trip: ", saved_trip)
+                        'message': "Bad request. No data provided"
+                    }
+                )
+            case {'destination': t_dest, 'date': t_date, 'capacity': t_cap, 'status': t_stat} if t_dest == None or t_date == None or t_cap == None or t_stat == None:
+                return sanjson(
+                    status=400,
+                    body={
+                        'message': 'Bad request. Missing required fields'
+                    }
+                )
     
-    if not saved_trip:
+        match trip_data['status']:
+            case 'pending':
+                trip_data['status'] = tripStatus.PENDING
+            case 'active':
+                trip_data['status'] = tripStatus.ACTIVE
+
+        print(trip_data)
+
+        trips = tripService.trips 
+    
+        # See Note [1] for the code below
+
+        trip = await tripService.fetch_trip()
+        if len(trips) >= 1:
+            match trips:
+                case [Trip as trip] if trip['destination']==trip_data['destination'] and trip['status']==tripStatus.PENDING and trip['date']==trip_data['date'] and len(trip['slot']) < trip['capacity']:
+                    # print(trip)
+                    # await 
+
+                    return sanjson(
+                        status=403,
+                        body={
+                            'status': 'err',
+                            "msg": f"Unable to create trip to '{trip_data.destination}'. Existing trip(s) with free slots found"
+                    })
+
+        new_trip = Trip(
+            destination=trip_data['destination'],
+            date=trip_data['date'],
+            status=trip_data['status'],
+            capacity=trip_data['capacity']
+        )
+        print(new_trip)
+
+        await tripService.create_trip(pool, new_trip)
+        saved_trip = await tripService.fetch_trip(new_trip.trip_id)
+        print("New Trip: ", saved_trip)
+    
+        if not saved_trip:
+            return sanjson(
+                status=404, 
+                body={
+                    'status': 'bad',
+                    'msg': 'Trip not created'
+                }
+            )
+
+        alarm_date = saved_trip.date - timedelta(days=2)
+        scheduler.add_job(
+            trip_task,
+            trigger=CronTrigger(
+                start_date=alarm_date,
+                end_date=trip.date
+            ),
+            app=app,
+            id=saved_trip.trip_id.hex,
+            coalesce=True,
+            replace_existing=True
+        )
+
+        trip_dict = saved_trip.model_dump()
+        if type(trip_dict['trip_id']) == UUID:
+            trip_dict['trip_id'] = trip_dict['trip_id'].hex
+        if type(trip_dict['destination']['destination_id']) == UUID:
+            trip_dict['destination']['destination_id'] = trip_dict['destination']['destination_id'].hex
+        if trip_dict['accounts']:
+            for account in trip_dic['accounts']:
+                if type(account['account_id']) == UUID:
+                    account['account_id'] = account['account_id'].hex
+
+        for client in sse_clients:
+            client[0].send(f"event: notice\ndata: {json.dumps({'message': 'New Trip created', 'data': trip_dict})}\n\n")
+        
+        # Send signal to websocket hanlder to update trip listing 
         return sanjson(
-            status=404, 
-            body={
-                'status': 'bad',
-                'msg': 'Trip not created'
+            status = 201, 
+            body = {
+               'status': 'ok',
+               'msg': 'Trip created',
+               'data': {'trip': saved_trip}
             }
         )
 
-    alarm_date = saved_trip.date - timedelta(days=2)
-    scheduler.add_job(
-        trip_task,
-        trigger=CronTrigger(
-            start_date=alarm_date,
-            end_date=trip.date
-        ),
-        app=app,
-        id=saved_trip.trip_id.hex,
-        coalesce=True,
-        replace_existing=True
-    )
-
-    trip_dict = saved_trip.model_dump()
-    if type(trip_dict['trip_id']) == UUID:
-        trip_dict['trip_id'] = trip_dict['trip_id'].hex
-    if type(trip_dict['destination']['destination_id']) == UUID:
-        trip_dict['destination']['destination_id'] = trip_dict['destination']['destination_id'].hex
-    if trip_dict['accounts']:
-        for account in trip_dic['accounts']:
-            if type(account['account_id']) == UUID:
-                account['account_id'] = account['account_id'].hex
-
-    for client in sse_clients:
-        client[0].send(f"event: notice\ndata: {json.dumps({'message': 'New Trip created', 'data': trip_dict})}\n\n")
-        
-    # Send signal to websocket hanlder to update trip listing 
-    return sanjson(
-        status = 201, 
-        body = {
-           'status': 'ok',
-           'msg': 'Trip created',
-           'data': {'trip': saved_trip}
-        }
-    )
+    except Exception as e:
+        logger.error(e)
            
 
 async def start_trip(request: Request, trip_id: str):

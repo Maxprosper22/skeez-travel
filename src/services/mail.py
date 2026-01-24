@@ -51,12 +51,12 @@ async def welcome_mail(app: Sanic, config: MailConfig, message: EmailMessage, ac
         ))
 
     await aiosmtplib.send(
-            message,
-            hostname=config.host,
-            port=config.port,
-            username=config.username,
-            password=config.password
-            )
+        message,
+        hostname=config.host,
+        port=config.port,
+        username=config.username,
+        password=config.password
+    )
 
 
 async def confirmation_mail(app: Sanic, config: MailConfig, message: EmailMessage, account: Account):

@@ -5,7 +5,7 @@ from enum import Enum
 
 
 class TicketStatus(Enum):
-    PROCCESSING = 'processing'
+    PENDING = 'pending'
     FAILURE = 'failure'
     SUCCESS = "success"
     CANCELLED = "cancelled"
